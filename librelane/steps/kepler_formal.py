@@ -22,6 +22,7 @@ import yaml
 
 from .pyosys import verilog_rtl_cfg_vars
 from .step import ViewsUpdate, MetricsUpdate, Step, StepError
+from ..common import Path
 from ..config import Variable
 from ..logging import info
 from ..state import DesignFormat, State
@@ -426,13 +427,13 @@ class LEC(Step):
     config_vars = [
         Variable(
             "KEPLER_FORMAL_LEC_REFERENCE",
-            Optional[str],
+            Optional[Path],
             "The reference gate-level netlist. If unset, the netlist written by the Yosys.Synthesis step of the same run is used.",
             default=None,
         ),
         Variable(
             "KEPLER_FORMAL_LEC_NETLIST",
-            Optional[str],
+            Optional[Path],
             "The gate-level netlist to check against the reference. If unset, the current netlist of the flow is used.",
             default=None,
         ),
