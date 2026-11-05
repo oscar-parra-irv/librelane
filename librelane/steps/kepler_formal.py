@@ -23,6 +23,7 @@ import yaml
 from .pyosys import verilog_rtl_cfg_vars
 from .step import ViewsUpdate, MetricsUpdate, Step, StepError
 from ..config import Variable
+from ..logging import info
 from ..state import DesignFormat, State
 
 # Kepler Formal exit codes for a completed SEC run. Any other non-zero exit is
@@ -375,4 +376,200 @@ class SEC(Step):
         )
         if bound is not None:
             metrics["design__equivalence__proof_bound"] = bound
+        return {}, metrics
+
+
+_LEC_EQUIVALENT = "No difference was found."
+_LEC_DIFFERENT = "Difference was found."
+_LEC_COMMON_OUTPUTS = re.compile(r"size of common outputs: (\d+)")
+_LEC_DIFF_OUTPUTS = re.compile(r"size of diff([01]) outputs: (\d+)")
+_LEC_PO_SUMMARY = re.compile(
+    r"design ([01]) PO summary by model/term[^\n]*\n((?:\|[^\n]*\n)+)"
+)
+_LEC_SUMMARY_ROW = re.compile(
+    r"^\|\s*(\S+)\s*\|\s*(\S+)\s*\|\s*(\d+)\s*\|", re.MULTILINE
+)
+
+
+@Step.factory.register()
+class LEC(Step):
+    """
+    Checks that the current gate-level netlist is logically equivalent to a
+    reference gate-level netlist using
+    `Kepler Formal <https://github.com/keplertech/kepler-formal>`_.
+
+    By default the reference is the netlist written by ``Yosys.Synthesis`` in
+    the same run, so the step checks that the implementation steps (resizing,
+    buffering, clock tree synthesis, antenna repair, ECOs...) did not change the
+    logic. The comparison is combinational: both netlists must keep the same
+    sequential elements and macros, which is the case after place and route.
+
+    Insert this step after any step that updates the netlist, for example with
+    ``"substituting_steps": {"+OpenROAD.DetailedRouting": "KeplerFormal.LEC"}``
+    in the configuration's ``meta`` object.
+
+    The flow stops when Kepler Formal finds a difference or fails to run.
+    Compare points that exist in only one of the netlists (e.g. the input of an
+    antenna diode added by place and route) are reported with a warning.
+    """
+
+    id = "KeplerFormal.LEC"
+    name = "Logic Equivalence Check"
+    long_name = "Netlist/Netlist Logic Equivalence Check"
+    inputs = [DesignFormat.NETLIST]
+    outputs = []
+
+    config_vars = [
+        Variable(
+            "KEPLER_FORMAL_LEC_REFERENCE",
+            Optional[str],
+            "The reference gate-level netlist. If unset, the netlist written by the Yosys.Synthesis step of the same run is used.",
+            default=None,
+        ),
+    ]
+
+    def _reference(self) -> str:
+        if reference := self.config.get("KEPLER_FORMAL_LEC_REFERENCE"):
+            path = os.path.abspath(reference)
+        else:
+            run_dir = os.path.dirname(os.path.abspath(self.step_dir))
+            design = self.config["DESIGN_NAME"]
+            found = sorted(
+                glob.glob(os.path.join(run_dir, "*-yosys-synthesis", f"{design}.nl.v"))
+            )
+            if not found:
+                raise StepError(
+                    "KeplerFormal.LEC: no synthesis netlist found in this run; set KEPLER_FORMAL_LEC_REFERENCE."
+                )
+            path = found[0]
+        if not os.path.isfile(path):
+            raise StepError(
+                f"KeplerFormal.LEC: reference netlist does not exist: {path}"
+            )
+        return path
+
+    def _libraries_and_models(self) -> Tuple[List[str], List[str]]:
+        libraries = self.toolbox.filter_views(self.config, self.config["CELL_LIBS"])
+        if pad_libs := self.config.get("PAD_LIBS"):
+            libraries += self.toolbox.filter_views(self.config, pad_libs)
+        libraries += self.config.get("EXTRA_LIBS") or []
+        models: List[str] = []
+        for name, macro in (self.config.get("MACROS") or {}).items():
+            macro_libs = self.toolbox.filter_views(self.config, macro.lib)
+            if macro.nl:
+                models += [str(path) for path in macro.nl]
+            elif macro_libs:
+                libraries += macro_libs
+            else:
+                raise StepError(
+                    f"KeplerFormal.LEC: macro '{name}' needs a netlist or a Liberty model to be part of the check."
+                )
+        library_paths = SEC._paths(libraries)
+        if not library_paths:
+            raise StepError("KeplerFormal.LEC: no Liberty models match DEFAULT_CORNER.")
+        return library_paths, SEC._paths(models)
+
+    def _diode_points(self, miter: str) -> int:
+        """Compare points of the current netlist that are antenna diode pins."""
+        diode = self.config.get("DIODE_CELL")
+        if not diode:
+            return 0
+        cell = str(diode).split("/")[0]
+        count = 0
+        for side, table in _LEC_PO_SUMMARY.findall(miter):
+            if side != "1":
+                continue
+            for model, _, n in _LEC_SUMMARY_ROW.findall(table):
+                if model == cell:
+                    count += int(n)
+        return count
+
+    def run(self, state_in: State, **kwargs) -> Tuple[ViewsUpdate, MetricsUpdate]:
+        step_dir = os.path.abspath(self.step_dir)
+        reference = self._reference()
+        current = os.path.abspath(str(state_in[DesignFormat.NETLIST]))
+        libraries, models = self._libraries_and_models()
+
+        designs: List[List[str]] = []
+        for index, netlist in enumerate((reference, current)):
+            files = [netlist] + models
+            # Fill, decap, tap and endcap cells without a Liberty model carry no
+            # logic; give them empty modules (same rule as KeplerFormal.SEC).
+            if stubs := SEC._physical_cells_without_models(self, netlist, libraries):  # type: ignore[arg-type]
+                stubs_path = os.path.join(step_dir, f"physical_cells_{index}.v")
+                with open(stubs_path, "w", encoding="utf8") as f:
+                    f.write("// Physical-only cells without a Liberty model.\n")
+                    for cell in stubs:
+                        f.write(f"module {cell} ();\nendmodule\n")
+                files.append(stubs_path)
+            designs.append(files)
+
+        command = ["kepler-formal", "-verilog", "-v", "lec"]
+        command += ["--design1", *designs[0], "--design2", *designs[1]]
+        command += ["--liberty", *libraries]
+        top = self.config["DESIGN_NAME"]
+        command += ["--verilog_design1_top", top, "--verilog_design2_top", top]
+
+        kwargs = kwargs.copy()
+        kwargs.update(cwd=step_dir, check=False)
+        try:
+            result = self.run_subprocess(command, **kwargs)
+        except OSError as e:
+            raise StepError(f"Could not launch Kepler Formal: {e}") from e
+
+        with open(result["log_path"], encoding="utf8") as f:
+            log = f.read()
+        see_log = f" See '{os.path.relpath(result['log_path'])}'."
+        miter_logs = sorted(glob.glob(os.path.join(step_dir, "miter_log_*.txt")))
+        miter = ""
+        if miter_logs:
+            with open(miter_logs[-1], encoding="utf8", errors="replace") as f:
+                miter = f.read()
+
+        if _LEC_DIFFERENT in log and _LEC_EQUIVALENT not in log:
+            raise StepError(
+                "KeplerFormal.LEC: the netlist is not equivalent to the reference netlist, Kepler Formal found a difference."
+                + see_log
+            )
+        if load_failure := _LOAD_FAILURE.search(log):
+            raise StepError(
+                f"KeplerFormal.LEC: Kepler Formal could not read the netlists: {load_failure[1].strip()}"
+                + see_log
+            )
+        if _LEC_EQUIVALENT not in log or result["returncode"] != 0:
+            raise StepError(
+                f"KeplerFormal.LEC: Kepler Formal did not report a verdict (exit code {result['returncode']})."
+                + see_log
+            )
+
+        common = _LEC_COMMON_OUTPUTS.search(miter)
+        compared = int(common[1]) if common else 0
+        only = {side: int(count) for side, count in _LEC_DIFF_OUTPUTS.findall(miter)}
+        unmatched = only.get("0", 0) + only.get("1", 0)
+        # Antenna diodes added by place and route have an input and no output:
+        # their pins are compare points of the current netlist only, and expected.
+        diodes = self._diode_points(miter)
+        unexpected = max(unmatched - diodes, 0)
+        if compared == 0:
+            self.warn(
+                "Kepler Formal compared no points: the netlists have no outputs in common."
+            )
+        if unexpected:
+            self.warn(
+                f"{unexpected} compare point(s) exist in only one netlist ({only.get('0', 0)} in the reference, {only.get('1', 0)} in the current netlist, {diodes} of them antenna diodes) and were not compared."
+            )
+        elif diodes:
+            info(
+                f"{diodes} antenna diode input(s) exist only in the current netlist; they carry no logic."
+            )
+
+        metrics = result.get("generated_metrics", {}).copy()
+        metrics.update(
+            {
+                "design__lec__equivalent": int(compared > 0),
+                "design__lec__compared_points": compared,
+                "design__lec__unmatched_points": unexpected,
+                "design__lec__antenna_diode_points": diodes,
+            }
+        )
         return {}, metrics
