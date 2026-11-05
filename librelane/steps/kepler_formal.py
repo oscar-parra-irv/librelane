@@ -551,9 +551,15 @@ class LEC(Step):
                 miter = f.read()
 
         if _LEC_DIFFERENT in log and _LEC_EQUIVALENT not in log:
+            # Kepler Formal points to "miter_log_x.txt"; name the actual file.
+            details = (
+                f" See '{os.path.relpath(miter_logs[-1])}' for the differing points."
+                if miter_logs
+                else see_log
+            )
             raise StepError(
                 "KeplerFormal.LEC: the netlist is not equivalent to the reference netlist, Kepler Formal found a difference."
-                + see_log
+                + details
             )
         if load_failure := _LOAD_FAILURE.search(log):
             raise StepError(
