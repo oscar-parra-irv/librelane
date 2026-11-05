@@ -408,6 +408,10 @@ class LEC(Step):
     ``"substituting_steps": {"+OpenROAD.DetailedRouting": "KeplerFormal.LEC"}``
     in the configuration's ``meta`` object.
 
+    To compare two existing netlists without running the rest of the flow, set
+    both ``KEPLER_FORMAL_LEC_REFERENCE`` and ``KEPLER_FORMAL_LEC_NETLIST`` and
+    use ``"flow": ["KeplerFormal.LEC"]`` in the configuration's ``meta`` object.
+
     The flow stops when Kepler Formal finds a difference or fails to run.
     Compare points that exist in only one of the netlists (e.g. the input of an
     antenna diode added by place and route) are reported with a warning.
@@ -416,7 +420,7 @@ class LEC(Step):
     id = "KeplerFormal.LEC"
     name = "Logic Equivalence Check"
     long_name = "Netlist/Netlist Logic Equivalence Check"
-    inputs = [DesignFormat.NETLIST]
+    inputs = [DesignFormat.NETLIST.mkOptional()]
     outputs = []
 
     config_vars = [
@@ -426,7 +430,26 @@ class LEC(Step):
             "The reference gate-level netlist. If unset, the netlist written by the Yosys.Synthesis step of the same run is used.",
             default=None,
         ),
+        Variable(
+            "KEPLER_FORMAL_LEC_NETLIST",
+            Optional[str],
+            "The gate-level netlist to check against the reference. If unset, the current netlist of the flow is used.",
+            default=None,
+        ),
     ]
+
+    def _current(self, state_in: State) -> str:
+        if netlist := self.config.get("KEPLER_FORMAL_LEC_NETLIST"):
+            path = os.path.abspath(netlist)
+        elif state_in.get_by_df(DesignFormat.NETLIST) is not None:
+            path = os.path.abspath(str(state_in.get_by_df(DesignFormat.NETLIST)))
+        else:
+            raise StepError(
+                "KeplerFormal.LEC: the flow has no netlist yet; set KEPLER_FORMAL_LEC_NETLIST."
+            )
+        if not os.path.isfile(path):
+            raise StepError(f"KeplerFormal.LEC: netlist does not exist: {path}")
+        return path
 
     def _reference(self) -> str:
         if reference := self.config.get("KEPLER_FORMAL_LEC_REFERENCE"):
@@ -487,7 +510,7 @@ class LEC(Step):
     def run(self, state_in: State, **kwargs) -> Tuple[ViewsUpdate, MetricsUpdate]:
         step_dir = os.path.abspath(self.step_dir)
         reference = self._reference()
-        current = os.path.abspath(str(state_in[DesignFormat.NETLIST]))
+        current = self._current(state_in)
         libraries, models = self._libraries_and_models()
 
         designs: List[List[str]] = []
