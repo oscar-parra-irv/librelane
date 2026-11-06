@@ -477,7 +477,11 @@ class LEC(Step):
         if pad_libs := self.config.get("PAD_LIBS"):
             libraries += self.toolbox.filter_views(self.config, pad_libs)
         libraries += self.config.get("EXTRA_LIBS") or []
-        models: List[str] = []
+        # Verilog models of cells without a Liberty view (e.g. bond pads added
+        # by the padring), as in KeplerFormal.SEC.
+        models: List[str] = [
+            str(path) for path in self.config.get("EXTRA_VERILOG_MODELS") or []
+        ]
         for name, macro in (self.config.get("MACROS") or {}).items():
             macro_libs = self.toolbox.filter_views(self.config, macro.lib)
             if macro.nl:
